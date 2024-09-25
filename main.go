@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -9,9 +11,14 @@ import (
 	"time"
 )
 
-type ProxyHandler struct{}
+type ProxyHandler struct {
+	secret []byte
+}
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// logging of input requests
+	p.logRequest(req)
+
 	if req.Method == http.MethodConnect {
 		p.handleHTTPS(w, req)
 	} else {
@@ -32,7 +39,7 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
 
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	io.Copy(NewCryptWriter(w, p.secret), NewCryptReader(resp.Body, p.secret))
 }
 
 func (p *ProxyHandler) handleHTTPS(w http.ResponseWriter, req *http.Request) {
@@ -61,8 +68,19 @@ func (p *ProxyHandler) handleHTTPS(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	go transfer(destConn, clientConn)
-	transfer(clientConn, destConn)
+	go transfer(NewCryptWriteCloser(destConn, p.secret), NewCryptReadCloser(clientConn, p.secret))
+	transfer(NewCryptWriteCloser(clientConn, p.secret), NewCryptReadCloser(destConn, p.secret))
+}
+
+func (p *ProxyHandler) logRequest(req *http.Request) {
+	fmt.Printf("Received request:\n")
+	fmt.Printf("Method: %s\n", req.Method)
+	fmt.Printf("URL: %s\n", req.URL.String())
+	fmt.Printf("Protocol: %s\n", req.Proto)
+	fmt.Printf("Headers: %v\n", req.Header)
+	fmt.Printf("Host: %s\n", req.Host)
+	fmt.Printf("RemoteAddr: %s\n", req.RemoteAddr)
+	fmt.Println("-----")
 }
 
 func transfer(dest io.WriteCloser, src io.ReadCloser) {
@@ -73,8 +91,8 @@ func transfer(dest io.WriteCloser, src io.ReadCloser) {
 
 func removeProxyHeaders(req *http.Request) {
 	headers := []string{
-		"Proxy-Connection", "Proxy-Authenticate", "Proxy-Authorization", "Connection", 
-		"Keep-Alive", "TE", "Trailers", "Transfer-Encoding", "Upgrade",
+		"Proxy-Connection", "Proxy-Authenticate", "Proxy-Authorization", "Connection", "TE",
+		"Trailers", "Transfer-Encoding", "Upgrade",
 	}
 	for _, h := range headers {
 		req.Header.Del(h)
@@ -89,18 +107,95 @@ func copyHeader(dst, src http.Header) {
 	}
 }
 
+func NewCryptReader(r io.Reader, key []byte) io.Reader {
+	return &cryptReader{r, key}
+}
+
+func NewCryptWriter(w io.Writer, key []byte) io.Writer {
+	return &cryptWriter{w, key}
+}
+
+func NewCryptReadCloser(rc io.ReadCloser, key []byte) io.ReadCloser {
+	return &cryptReadCloser{cryptReader{rc, key}, rc}
+}
+
+func NewCryptWriteCloser(wc io.WriteCloser, key []byte) io.WriteCloser {
+	return &cryptWriteCloser{cryptWriter{wc, key}, wc}
+}
+
+type cryptReader struct {
+	r   io.Reader
+	key []byte
+}
+
+func (c *cryptReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if err != nil {
+		return n, err
+	}
+	crypt(p[:n], c.key)
+	return n, nil
+}
+
+type cryptWriter struct {
+	w   io.Writer
+	key []byte
+}
+
+func (c *cryptWriter) Write(p []byte) (int, error) {
+	crypt(p, c.key)
+	return c.w.Write(p)
+}
+
+type cryptReadCloser struct {
+	cryptReader
+	rc io.ReadCloser
+}
+
+func (c *cryptReadCloser) Close() error {
+	return c.rc.Close()
+}
+
+type cryptWriteCloser struct {
+	cryptWriter
+	wc io.WriteCloser
+}
+
+func (c *cryptWriteCloser) Close() error {
+	return c.wc.Close()
+}
+
+func crypt(data, key []byte) {
+	keyLen := len(key)
+	for i := range data {
+		data[i] ^= key[i%keyLen]
+	}
+}
+
+func generateRandomKey(size int) ([]byte, error) {
+	key := make([]byte, size)
+	_, err := rand.Read(key)
+	return key, err
+}
+
 func main() {
 	var listenAddr, port string
 	flag.StringVar(&listenAddr, "listen", "0.0.0.0", "Address to listen on")
-	flag.StringVar(&port, "port", "8080", "Port to listen on")
+	flag.StringVar(&port, "port", "8081", "Port to listen on")
 	flag.Parse()
+
+	key, err := generateRandomKey(32)
+	if err != nil {
+		log.Fatalf("Failed to generate encryption key: %v", err)
+	}
+	log.Printf("Encryption key: %x", key)
 
 	server := &http.Server{
 		Addr:         net.JoinHostPort(listenAddr, port),
-		Handler:      &ProxyHandler{},
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Handler:      &ProxyHandler{secret: key},
+		ReadTimeout:  1 * time.Second,
+		WriteTimeout: 1 * time.Second,
+		IdleTimeout:  1 * time.Second,
 	}
 
 	log.Printf("Starting proxy server on %s:%s", listenAddr, port)
